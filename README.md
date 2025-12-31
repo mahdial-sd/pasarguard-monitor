@@ -113,6 +113,9 @@ restore_minutes: 1440
 ---
 
 ## 📞 پشتیبانی
+- **Telegram**: [@mahdial_sd](https://t.me/luckypingadmin)
+
+
 
 - **GitHub Issues**: [گزارش باگ](https://github.com/mahdial-sd/pasarguard-monitor/issues)
 - **لایسنس**: MIT
