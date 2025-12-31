@@ -44,7 +44,6 @@ cd pasarguard-monitor
 go build -o pasarguard-monitor main.go
 ./pasarguard-monitor
 
-text
 ---
 
 ## 🤖 دستورات ربات
@@ -90,7 +89,6 @@ journalctl -u pasarguard-monitor -f
 ری‌استارت
 systemctl restart pasarguard-monitor
 
-text
 ---
 
 ## ⚙️ پیکربندی
