@@ -34,7 +34,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/mahdial-sd/pasarguard-monitor/
 ### پیش‌نیازها
 - سرور لینوکس (Ubuntu 20.04+ یا Debian 11+)
 - دسترسی Root
-- پنل Marzban یا Marzneshin
+- پنل   Pasargaurd
 - Go 1.21+
 
 ### مراحل
