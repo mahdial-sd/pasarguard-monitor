@@ -1,0 +1,20 @@
+[0;1;32m●[0m pasarguard-monitor.service - PasarGuard Monitor Service
+     Loaded: loaded (/etc/systemd/system/pasarguard-monitor.service; enabled; vendor preset: enabled)
+     Active: [0;1;32mactive (running)[0m since Sun 2025-12-28 13:59:10 UTC; 3min 22s ago
+   Main PID: 1050970 (pasarguard-moni)
+      Tasks: 4 (limit: 2218)
+     Memory: 7.6M
+        CPU: 3.623s
+     CGroup: /system.slice/pasarguard-monitor.service
+             └─1050970 /opt/pasarguard-monitor/pasarguard-monitor
+
+Dec 28 14:02:03 deeplylocket.aeza.network pasarguard-monitor[1050970]: 2025/12/28 14:02:03 🔍 userlimit command from chatID: 698823746, args: set V2MTUSER-131 4
+Dec 28 14:02:03 deeplylocket.aeza.network pasarguard-monitor[1050970]: 2025/12/28 14:02:03 ✅ Saved user limits: default=4, custom=21 users
+Dec 28 14:02:04 deeplylocket.aeza.network pasarguard-monitor[1050970]: 2025/12/28 14:02:04 Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+Dec 28 14:02:04 deeplylocket.aeza.network pasarguard-monitor[1050970]: 2025/12/28 14:02:04 Failed to get updates, retrying in 3 seconds...
+Dec 28 14:02:07 deeplylocket.aeza.network pasarguard-monitor[1050970]: 2025/12/28 14:02:07 🔍 userlimit command from chatID: 698823746, args: set V2MTUSER-132 4
+Dec 28 14:02:07 deeplylocket.aeza.network pasarguard-monitor[1050970]: 2025/12/28 14:02:07 ✅ Saved user limits: default=4, custom=22 users
+Dec 28 14:02:10 deeplylocket.aeza.network pasarguard-monitor[1050970]: 2025/12/28 14:02:10 🔍 userlimit command from chatID: 698823746, args: set V2MTUSER-133 4
+Dec 28 14:02:10 deeplylocket.aeza.network pasarguard-monitor[1050970]: 2025/12/28 14:02:10 ✅ Saved user limits: default=4, custom=23 users
+Dec 28 14:02:14 deeplylocket.aeza.network pasarguard-monitor[1050970]: 2025/12/28 14:02:14 🔍 userlimit command from chatID: 698823746, args: set V2MTUSER-134 4
+Dec 28 14:02:14 deeplylocket.aeza.network pasarguard-monitor[1050970]: 2025/12/28 14:02:14 ✅ Saved user limits: default=4, custom=24 users

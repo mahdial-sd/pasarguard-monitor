@@ -1,0 +1,15 @@
+panel_url: https://panel.example.com:2087
+username: admin
+password: "USE_ENVIRONMENT_VARIABLE"
+telegram_bot_token: YOUR_BOT_TOKEN_HERE
+telegram_chat_id: 123456789
+sub_admins:
+  - 987654321
+send_interval: 10
+enable_blocked: true
+enable_rejected: true
+enable_connected: false
+ip_limit: 2
+restore_minutes: 1440
+whitelist:
+  - admin

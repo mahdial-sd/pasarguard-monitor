@@ -1,0 +1,12 @@
+# فایل‌های کانفیگ حساس
+config.yaml
+config.json
+user-limits.json
+
+# باینری
+pasarguard-monitor
+
+# فایل‌های موقت
+*.log
+*.swp
+*.tmp

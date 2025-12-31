@@ -1,0 +1,953 @@
+package main
+
+import (
+    "bufio"
+    "bytes"
+    "crypto/tls"
+    "encoding/json"
+    "fmt"
+    "io/ioutil"
+    "log"
+    "net/http"
+    "regexp"
+    "strings"
+    "sync"
+    "time"
+
+    tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+    "gopkg.in/yaml.v3"
+)
+
+type Config struct {
+    PanelURL         string   `yaml:"panel_url"`
+    Username         string   `yaml:"username"`
+    Password         string   `yaml:"password"`
+    TelegramBotToken string   `yaml:"telegram_bot_token"`
+    TelegramChatID   int64    `yaml:"telegram_chat_id"`
+    SendInterval     int      `yaml:"send_interval"`
+    EnableBlocked    bool     `yaml:"enable_blocked"`
+    EnableRejected   bool     `yaml:"enable_rejected"`
+    EnableConnected  bool     `yaml:"enable_connected"`
+    IPLimit          int      `yaml:"ip_limit"`
+    RestoreMinutes   int      `yaml:"restore_minutes"`
+    Whitelist        []string `yaml:"whitelist"`
+}
+
+
+type UserDetail struct {
+    Username    string `json:"username"`
+    Status      string `json:"status"`
+    UsedTraffic int64  `json:"used_traffic"`
+    DataLimit   int64  `json:"data_limit"`
+    Expire      string `json:"expire"`
+    OnlineAt    string `json:"online_at"`
+}
+
+type Node struct {
+    ID   int    `json:"id"`
+    Name string `json:"name"`
+}
+
+type LogEvent struct {
+    Timestamp string
+    Username  string
+    IP        string
+    NodeName  string
+    EventType string
+}
+
+type ActiveIP struct {
+    Username string
+    IP       string
+    NodeName string
+    LastSeen time.Time
+}
+
+type Stats struct {
+    BlockedToday   int
+    RejectedToday  int
+    ConnectedToday int
+    LastReset      time.Time
+}
+
+type ViolationRecord struct {
+    Username     string
+    ViolationCount int
+    LastViolation time.Time
+    DisabledAt   *time.Time
+}
+
+var (
+    violations      map[string]*ViolationRecord
+    violationsMutex sync.Mutex
+)
+
+var (
+    config      Config
+    bot         *tgbotapi.BotAPI
+    authToken   string
+    httpClient  *http.Client
+    logPattern  *regexp.Regexp
+    
+    blockedEvents   []LogEvent
+    rejectedEvents  []LogEvent
+    connectedEvents []LogEvent
+    eventMutex      sync.Mutex
+    
+    activeIPs      map[string]*ActiveIP
+    activeIPsMutex sync.RWMutex
+    
+    dailyStats Stats
+    statsMutex sync.Mutex
+)
+
+func main() {
+    log.SetFlags(log.LstdFlags)
+    log.Println("🚀 PasarGuard Monitor Starting...")
+
+    if err := loadConfig("config.yaml"); err != nil {
+        log.Fatalf("❌ Failed to load config: %v", err)
+    }
+
+    httpClient = &http.Client{
+        Transport: &http.Transport{
+            TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+        },
+        Timeout: 0,
+    }
+    
+    logPattern = regexp.MustCompile(`^data: ([^ ]+\s+[^ ]+) from ([\d.]+):\d+ (\w+) .*email: (.+)$`)
+    activeIPs = make(map[string]*ActiveIP)
+    violations = make(map[string]*ViolationRecord)
+    dailyStats = Stats{LastReset: time.Now()}
+
+    var err error
+    bot, err = tgbotapi.NewBotAPI(config.TelegramBotToken)
+    if err != nil {
+        log.Fatalf("❌ Failed to connect to Telegram: %v", err)
+    }
+    log.Printf("✅ Connected to Telegram as @%s", bot.Self.UserName)
+
+    if err := login(); err != nil {
+        log.Fatalf("❌ Login failed: %v", err)
+    }
+    log.Println("✅ Logged in successfully")
+
+    nodes, err := getNodes()
+    if err != nil {
+        log.Fatalf("❌ Failed to get nodes: %v", err)
+    }
+    log.Printf("✅ Found %d nodes", len(nodes))
+
+    sendMessage("🟢 سرویس مانیتور پاسارگاد راه‌اندازی شد\n\nدستورات:\n/stats - آمار\n/user <username> - جستجو\n/help - راهنما")
+
+    go handleTelegramCommands()
+    go sendPeriodicUpdates()
+    go cleanupOldIPs()
+    go sendDailyStats()
+   go sendActiveUsersReport()
+   go autoDisableViolators()
+   go autoRestoreUsers()
+
+    var wg sync.WaitGroup
+    for _, node := range nodes {
+        wg.Add(1)
+        go func(n Node) {
+            defer wg.Done()
+            streamNodeLogs(n)
+        }(node)
+    }
+
+    wg.Wait()
+}
+
+func loadConfig(filename string) error {
+    data, err := ioutil.ReadFile(filename)
+    if err != nil {
+        return err
+    }
+    return yaml.Unmarshal(data, &config)
+}
+
+func login() error {
+    loginData := fmt.Sprintf("username=%s&password=%s", config.Username, config.Password)
+    resp, err := httpClient.Post(
+        config.PanelURL+"/api/admin/token",
+        "application/x-www-form-urlencoded",
+        bytes.NewBuffer([]byte(loginData)),
+    )
+    if err != nil {
+        return err
+    }
+    defer resp.Body.Close()
+
+    var result map[string]interface{}
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return err
+    }
+
+    authToken = result["access_token"].(string)
+    return nil
+}
+
+func getNodes() ([]Node, error) {
+    req, _ := http.NewRequest("GET", config.PanelURL+"/api/nodes", nil)
+    req.Header.Set("Authorization", "Bearer "+authToken)
+
+    resp, err := httpClient.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close()
+
+    var result struct {
+        Nodes []Node `json:"nodes"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return nil, err
+    }
+
+    return result.Nodes, nil
+}
+
+func streamNodeLogs(node Node) {
+    log.Printf("📂 Monitoring node: %s (ID: %d)", node.Name, node.ID)
+
+    for {
+        func() {
+            req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/node/%d/logs", config.PanelURL, node.ID), nil)
+            req.Header.Set("Authorization", "Bearer "+authToken)
+
+            resp, err := httpClient.Do(req)
+            if err != nil {
+                log.Printf("❌ Error connecting to %s: %v. Retrying in 10s...", node.Name, err)
+                time.Sleep(10 * time.Second)
+                return
+            }
+            defer resp.Body.Close()
+
+            scanner := bufio.NewScanner(resp.Body)
+            for scanner.Scan() {
+                line := scanner.Text()
+                if line != "" {
+                    processLogLine(line, node.Name)
+                }
+            }
+
+            if err := scanner.Err(); err != nil {
+                log.Printf("❌ Error streaming logs for %s: %v. Retrying in 10s...", node.Name, err)
+                time.Sleep(10 * time.Second)
+            }
+        }()
+    }
+}
+
+func processLogLine(line, nodeName string) {
+    match := logPattern.FindStringSubmatch(line)
+    if len(match) < 5 {
+        return
+    }
+
+    timestamp := match[1]
+    ip := match[2]
+    eventType := match[3]
+    rawEmail := match[4]
+    
+    username := rawEmail
+    if strings.Contains(rawEmail, ".") {
+        parts := strings.Split(rawEmail, ".")
+        if len(parts) > 1 {
+            username = parts[1]
+        }
+    }
+
+    event := LogEvent{
+        Timestamp: timestamp,
+        Username:  username,
+        IP:        ip,
+        NodeName:  nodeName,
+        EventType: eventType,
+    }
+
+    if eventType == "accepted" {
+        trackActiveIP(username, ip, nodeName)
+    }
+
+    eventMutex.Lock()
+    defer eventMutex.Unlock()
+
+    if eventType == "rejected" && config.EnableRejected {
+        rejectedEvents = append(rejectedEvents, event)
+        updateStats("rejected")
+    } else if eventType == "accepted" && config.EnableConnected {
+        connectedEvents = append(connectedEvents, event)
+        updateStats("connected")
+    } else if eventType != "accepted" && eventType != "rejected" && config.EnableBlocked {
+        blockedEvents = append(blockedEvents, event)
+        updateStats("blocked")
+    }
+}
+
+func trackActiveIP(username, ip, nodeName string) {
+    activeIPsMutex.Lock()
+    defer activeIPsMutex.Unlock()
+    
+    key := username + "-" + ip
+    activeIPs[key] = &ActiveIP{
+        Username: username,
+        IP:       ip,
+        NodeName: nodeName,
+        LastSeen: time.Now(),
+    }
+}
+
+func cleanupOldIPs() {
+    ticker := time.NewTicker(30 * time.Second)
+    for range ticker.C {
+        activeIPsMutex.Lock()
+        now := time.Now()
+        for key, active := range activeIPs {
+            if now.Sub(active.LastSeen) > 60*time.Second {
+                delete(activeIPs, key)
+            }
+        }
+        activeIPsMutex.Unlock()
+    }
+}
+
+func updateStats(eventType string) {
+    statsMutex.Lock()
+    defer statsMutex.Unlock()
+    
+    if time.Since(dailyStats.LastReset) > 24*time.Hour {
+        dailyStats = Stats{LastReset: time.Now()}
+    }
+    
+    switch eventType {
+    case "blocked":
+        dailyStats.BlockedToday++
+    case "rejected":
+        dailyStats.RejectedToday++
+    case "connected":
+        dailyStats.ConnectedToday++
+    }
+}
+
+func sendPeriodicUpdates() {
+    ticker := time.NewTicker(time.Duration(config.SendInterval) * time.Second)
+    for range ticker.C {
+        sendTelegramUpdates()
+    }
+}
+
+func sendTelegramUpdates() {
+    eventMutex.Lock()
+    blocked := blockedEvents
+    rejected := rejectedEvents
+    connected := connectedEvents
+    blockedEvents = nil
+    rejectedEvents = nil
+    connectedEvents = nil
+    eventMutex.Unlock()
+
+    if len(blocked) == 0 && len(rejected) == 0 && len(connected) == 0 {
+        return
+    }
+
+    var message strings.Builder
+
+    if len(blocked) > 0 {
+        message.WriteString("🚫 کاربران بلاک شده:\n")
+        seen := make(map[string]bool)
+        for _, event := range blocked {
+            key := event.Username + "-" + event.IP
+            if !seen[key] {
+                seen[key] = true
+                
+                details := getUserDetails(event.Username)
+                message.WriteString(fmt.Sprintf("نود %s:\n", event.NodeName))
+                message.WriteString(fmt.Sprintf("  • %s - IP: %s\n", event.Username, event.IP))
+                if details != "" {
+                    message.WriteString(fmt.Sprintf("    %s\n", details))
+                }
+            }
+        }
+        message.WriteString("\n")
+    }
+
+    if len(rejected) > 0 {
+        message.WriteString("❌ اتصالات رد شده:\n")
+        seen := make(map[string]bool)
+        for _, event := range rejected {
+            key := event.Username + "-" + event.IP
+            if !seen[key] {
+                seen[key] = true
+                message.WriteString(fmt.Sprintf("نود %s:\n", event.NodeName))
+                message.WriteString(fmt.Sprintf("  • %s - IP: %s\n", event.Username, event.IP))
+            }
+        }
+        message.WriteString("\n")
+    }
+
+    if len(connected) > 0 {
+        message.WriteString("🟢 اتصالات جدید:\n")
+        seen := make(map[string]bool)
+        nodeGroups := make(map[string][]LogEvent)
+        
+        for _, event := range connected {
+            key := event.Username + "-" + event.IP
+            if !seen[key] {
+                seen[key] = true
+                nodeGroups[event.NodeName] = append(nodeGroups[event.NodeName], event)
+            }
+        }
+        
+        for nodeName, events := range nodeGroups {
+            message.WriteString(fmt.Sprintf("نود %s:\n", nodeName))
+            for _, event := range events {
+                message.WriteString(fmt.Sprintf("  • %s - IP: %s\n", event.Username, event.IP))
+            }
+        }
+    }
+
+    if message.Len() > 0 {
+        sendMessage(message.String())
+    }
+}
+
+func getUserDetails(username string) string {
+    req, _ := http.NewRequest("GET", config.PanelURL+"/api/user/"+username, nil)
+    req.Header.Set("Authorization", "Bearer "+authToken)
+
+    resp, err := httpClient.Do(req)
+    if err != nil {
+        return "⚠️ خطا در دریافت اطلاعات"
+    }
+    defer resp.Body.Close()
+
+    var user UserDetail
+    if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
+        return "⚠️ خطا در parse"
+    }
+
+    var details strings.Builder
+    
+    statusEmoji := "✅"
+    if user.Status != "active" {
+        statusEmoji = "🔴"
+    }
+    details.WriteString(fmt.Sprintf("%s %s", statusEmoji, user.Status))
+    
+    usedGB := float64(user.UsedTraffic) / 1073741824
+    limitGB := float64(user.DataLimit) / 1073741824
+    percentage := (float64(user.UsedTraffic) / float64(user.DataLimit)) * 100
+    details.WriteString(fmt.Sprintf(" | 📊 %.1fGB/%.0fGB (%.0f%%)", usedGB, limitGB, percentage))
+    
+    if user.Expire != "" {
+        expireTime, err := time.Parse(time.RFC3339, user.Expire)
+        if err == nil {
+            daysLeft := int(time.Until(expireTime).Hours() / 24)
+            if daysLeft < 0 {
+                details.WriteString(" | ⏰ منقضی شده")
+            } else {
+                details.WriteString(fmt.Sprintf(" | ⏰ %d روز", daysLeft))
+            }
+        }
+    }
+
+    return details.String()
+}
+
+func handleTelegramCommands() {
+    u := tgbotapi.NewUpdate(0)
+    u.Timeout = 60
+
+    updates := bot.GetUpdatesChan(u)
+
+    for update := range updates {
+        if update.Message == nil {
+            continue
+        }
+
+        if update.Message.Chat.ID != config.TelegramChatID {
+            continue
+        }
+
+        command := update.Message.Command()
+        args := update.Message.CommandArguments()
+
+        switch command {
+                case "start", "help":
+            helpText := `📚 راهنمای دستورات:
+
+📊 مانیتورینگ:
+/stats - آمار کلی سیستم
+/user <username> - جستجوی یوزر و IP های فعال
+/nodes - وضعیت نودها
+
+⚙️ تنظیمات محدودیت IP:
+/settings - نمایش تنظیمات فعلی
+/setlimit <عدد> - تغییر حد مجاز IP
+/setrestore <دقیقه> - زمان بازگردانی خودکار
+
+📋 مدیریت استثناها:
+/whitelist add <username> - افزودن به لیست سفید
+/whitelist remove <username> - حذف از لیست سفید
+/whitelist list - نمایش لیست
+
+/help - نمایش این راهنما`
+            sendMessage(helpText)
+
+
+        case "stats":
+            handleStatsCommand()
+
+        case "user":
+            if args == "" {
+                sendMessage("❌ لطفاً نام کاربری را وارد کنید:\n/user username")
+            } else {
+                handleUserCommand(args)
+            }
+
+        case "nodes":
+            handleNodesCommand()
+        case "setlimit":
+            if args == "" {
+                sendMessage("❌ مثال: /setlimit 5")
+            } else {
+                handleSetLimit(args)
+            }
+
+        case "setrestore":
+            if args == "" {
+                sendMessage("❌ مثال: /setrestore 90")
+            } else {
+                handleSetRestore(args)
+            }
+
+        case "whitelist":
+            handleWhitelist(args)
+
+        case "settings":
+            handleSettingsCommand()
+
+        }
+    }
+}
+
+func handleStatsCommand() {
+    statsMutex.Lock()
+    stats := dailyStats
+    statsMutex.Unlock()
+
+    activeIPsMutex.RLock()
+    activeCount := len(activeIPs)
+    activeIPsMutex.RUnlock()
+
+    message := fmt.Sprintf(`📊 آمار سیستم
+
+🚫 بلاک شده امروز: %d
+❌ رد شده امروز: %d
+🟢 اتصال جدید امروز: %d
+📡 کاربران فعال الان: %d
+
+🕐 ساعت: %s`,
+        stats.BlockedToday,
+        stats.RejectedToday,
+        stats.ConnectedToday,
+        activeCount,
+        time.Now().Format("15:04:05"),
+    )
+
+    sendMessage(message)
+}
+
+func handleUserCommand(username string) {
+    details := getUserDetails(username)
+    
+    activeIPsMutex.RLock()
+    var userIPs []string
+    for _, active := range activeIPs {
+        if active.Username == username {
+            userIPs = append(userIPs, fmt.Sprintf("  • IP: %s | نود: %s | %s پیش",
+                active.IP,
+                active.NodeName,
+                time.Since(active.LastSeen).Round(time.Second),
+            ))
+        }
+    }
+    activeIPsMutex.RUnlock()
+
+    var message strings.Builder
+    message.WriteString(fmt.Sprintf("👤 کاربر: %s\n\n", username))
+    
+    if details != "" {
+        message.WriteString(details + "\n\n")
+    }
+    
+    if len(userIPs) > 0 {
+        message.WriteString(fmt.Sprintf("📍 IP های فعال (%d):\n", len(userIPs)))
+        for _, ip := range userIPs {
+            message.WriteString(ip + "\n")
+        }
+    } else {
+        message.WriteString("⚠️ هیچ IP فعالی یافت نشد")
+    }
+
+    sendMessage(message.String())
+}
+
+func handleNodesCommand() {
+    nodes, err := getNodes()
+    if err != nil {
+        sendMessage("❌ خطا در دریافت لیست نودها")
+        return
+    }
+
+    var message strings.Builder
+    message.WriteString(fmt.Sprintf("📡 لیست نودها (%d):\n\n", len(nodes)))
+    
+    for _, node := range nodes {
+        message.WriteString(fmt.Sprintf("• %s (ID: %d)\n", node.Name, node.ID))
+    }
+
+    sendMessage(message.String())
+}
+func sendActiveUsersReport() {
+    log.Println("🔍 DEBUG: sendActiveUsersReport goroutine started")
+    ticker := time.NewTicker(5 * time.Minute)
+    for range ticker.C {
+        log.Println("🔍 DEBUG: Generating active users report...")
+        activeIPsMutex.RLock()
+        
+        userIPs := make(map[string][]string)
+        for _, active := range activeIPs {
+            userIPs[active.Username] = append(userIPs[active.Username], 
+                fmt.Sprintf("%s (نود: %s)", active.IP, active.NodeName))
+        }
+        totalUsers := len(userIPs)
+        activeIPsMutex.RUnlock()
+        
+        log.Printf("🔍 DEBUG: Found %d active users", totalUsers)
+        
+        if len(userIPs) == 0 {
+            continue
+        }
+
+        var message strings.Builder
+        message.WriteString(fmt.Sprintf("📊 گزارش کاربران فعال - %s\n\n", 
+            time.Now().Format("15:04")))
+
+        multiIPUsers := 0
+        for username, ips := range userIPs {
+            if len(ips) > 1 {
+                multiIPUsers++
+                message.WriteString(fmt.Sprintf("👤 %s (%d IP):\n", username, len(ips)))
+                for _, ip := range ips {
+                    message.WriteString(fmt.Sprintf("  • %s\n", ip))
+                }
+                message.WriteString("\n")
+            }
+        }
+
+        if multiIPUsers == 0 {
+            message.WriteString("✅ همه کاربران تک IP هستند")
+        } else {
+            message.WriteString(fmt.Sprintf("⚠️ تعداد کاربران چند IP: %d", multiIPUsers))
+        }
+
+        sendMessage(message.String())
+    }
+}
+
+func autoDisableViolators() {
+    ticker := time.NewTicker(5 * time.Minute)
+    for range ticker.C {
+        activeIPsMutex.RLock()
+        userIPCount := make(map[string]int)
+        for _, active := range activeIPs {
+            userIPCount[active.Username]++
+        }
+        activeIPsMutex.RUnlock()
+        
+        violationsMutex.Lock()
+        for username, count := range userIPCount {
+            // چک کن در whitelist هست یا نه
+            if isWhitelisted(username) {
+                continue
+            }
+            
+            if count > config.IPLimit {
+                if violations[username] == nil {
+                    violations[username] = &ViolationRecord{
+                        Username: username,
+                    }
+                }
+                
+                rec := violations[username]
+                
+                // اگه قبلاً disable شده، skip
+                if rec.DisabledAt != nil {
+                    continue
+                }
+                
+                // افزایش تعداد تخلف
+                if time.Since(rec.LastViolation) > 10*time.Minute {
+                    rec.ViolationCount = 1
+                } else {
+                    rec.ViolationCount++
+                }
+                rec.LastViolation = time.Now()
+                
+                log.Printf("⚠️ %s has %d IPs (violation %d/3)", username, count, rec.ViolationCount)
+                
+                // بعد از 3 بار، disable کن
+                if rec.ViolationCount >= 3 {
+                    if disableUser(username) {
+                        now := time.Now()
+                        rec.DisabledAt = &now
+                        msg := fmt.Sprintf("🚫 کاربر %s به دلیل %d IP فعال غیرفعال شد\n⏰ روشن می‌شود: %d دقیقه دیگر",
+                            username, count, config.RestoreMinutes)
+                        sendMessage(msg)
+                        log.Printf("🚫 Disabled user: %s (%d IPs)", username, count)
+                    }
+                }
+            }
+        }
+        violationsMutex.Unlock()
+    }
+}
+
+func autoRestoreUsers() {
+    ticker := time.NewTicker(1 * time.Minute)
+    for range ticker.C {
+        violationsMutex.Lock()
+        for username, rec := range violations {
+            if rec.DisabledAt != nil {
+                if time.Since(*rec.DisabledAt) >= time.Duration(config.RestoreMinutes)*time.Minute {
+                    if enableUser(username) {
+                        msg := fmt.Sprintf("✅ کاربر %s دوباره فعال شد", username)
+                        sendMessage(msg)
+                        log.Printf("✅ Re-enabled user: %s", username)
+                        delete(violations, username)
+                    }
+                }
+            }
+        }
+        violationsMutex.Unlock()
+    }
+}
+
+func isWhitelisted(username string) bool {
+    for _, w := range config.Whitelist {
+        if w == username {
+            return true
+        }
+    }
+    return false
+}
+
+func disableUser(username string) bool {
+    payload := map[string]interface{}{"status": "disabled"}
+    return updateUserStatus(username, payload)
+}
+
+func enableUser(username string) bool {
+    payload := map[string]interface{}{"status": "active"}
+    return updateUserStatus(username, payload)
+}
+
+func updateUserStatus(username string, payload map[string]interface{}) bool {
+    jsonData, _ := json.Marshal(payload)
+    
+    req, _ := http.NewRequest("PUT", config.PanelURL+"/api/user/"+username, bytes.NewBuffer(jsonData))
+    req.Header.Set("Authorization", "Bearer "+authToken)
+    req.Header.Set("Content-Type", "application/json")
+    
+    resp, err := httpClient.Do(req)
+    if err != nil {
+        log.Printf("❌ Failed to update %s: %v", username, err)
+        return false
+    }
+    defer resp.Body.Close()
+    
+    return resp.StatusCode == 200
+}
+
+
+func sendDailyStats() {
+    now := time.Now()
+    midnight := time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, now.Location())
+    time.Sleep(time.Until(midnight))
+
+    ticker := time.NewTicker(24 * time.Hour)
+    for range ticker.C {
+        statsMutex.Lock()
+        stats := dailyStats
+        dailyStats = Stats{LastReset: time.Now()}
+        statsMutex.Unlock()
+
+        message := fmt.Sprintf(`📊 گزارش روزانه
+
+🚫 بلاک شده: %d
+❌ رد شده: %d  
+🟢 اتصالات: %d
+
+📅 %s`,
+            stats.BlockedToday,
+            stats.RejectedToday,
+            stats.ConnectedToday,
+            time.Now().Format("2006-01-02"),
+        )
+
+        sendMessage(message)
+    }
+}
+
+func handleSetLimit(args string) {
+    var limit int
+    fmt.Sscanf(args, "%d", &limit)
+    if limit < 1 || limit > 20 {
+        sendMessage("❌ عدد باید بین 1 تا 20 باشد")
+        return
+    }
+    config.IPLimit = limit
+    saveConfig()
+    sendMessage(fmt.Sprintf("✅ حد IP به %d تغییر کرد", limit))
+}
+
+func handleSetRestore(args string) {
+    var minutes int
+    fmt.Sscanf(args, "%d", &minutes)
+    if minutes < 10 || minutes > 1440 {
+        sendMessage("❌ زمان باید بین 10 تا 1440 دقیقه باشد")
+        return
+    }
+    config.RestoreMinutes = minutes
+    saveConfig()
+    sendMessage(fmt.Sprintf("✅ زمان بازگردانی به %d دقیقه تغییر کرد", minutes))
+}
+
+func handleWhitelist(args string) {
+    parts := strings.Fields(args)
+    if len(parts) == 0 {
+        sendMessage("❌ دستور نامعتبر\n\n/whitelist add username\n/whitelist remove username\n/whitelist list")
+        return
+    }
+    
+    action := parts[0]
+    
+    switch action {
+    case "add":
+        if len(parts) < 2 {
+            sendMessage("❌ نام کاربری را وارد کنید")
+            return
+        }
+        username := parts[1]
+        config.Whitelist = append(config.Whitelist, username)
+        saveConfig()
+        sendMessage(fmt.Sprintf("✅ %s به لیست استثنا اضافه شد", username))
+        
+    case "remove":
+        if len(parts) < 2 {
+            sendMessage("❌ نام کاربری را وارد کنید")
+            return
+        }
+        username := parts[1]
+        newList := []string{}
+        for _, w := range config.Whitelist {
+            if w != username {
+                newList = append(newList, w)
+            }
+        }
+        config.Whitelist = newList
+        saveConfig()
+        sendMessage(fmt.Sprintf("✅ %s از لیست استثنا حذف شد", username))
+        
+    case "list":
+        if len(config.Whitelist) == 0 {
+            sendMessage("📋 لیست استثنا خالی است")
+            return
+        }
+        var msg strings.Builder
+        msg.WriteString("📋 لیست استثنا:\n\n")
+        for _, w := range config.Whitelist {
+            msg.WriteString(fmt.Sprintf("• %s\n", w))
+        }
+        sendMessage(msg.String())
+        
+    default:
+        sendMessage("❌ دستور نامعتبر")
+    }
+}
+
+func handleSettingsCommand() {
+    msg := fmt.Sprintf(`⚙️ تنظیمات فعلی:
+
+🔢 حد IP: %d
+⏰ زمان بازگردانی: %d دقیقه
+📋 تعداد استثنا: %d
+
+دستورات:
+/setlimit <عدد> - تغییر حد IP
+/setrestore <دقیقه> - تغییر زمان بازگردانی
+/whitelist add <username> - افزودن استثنا
+/whitelist remove <username> - حذف استثنا
+/whitelist list - نمایش لیست`,
+        config.IPLimit,
+        config.RestoreMinutes,
+        len(config.Whitelist),
+    )
+    sendMessage(msg)
+}
+
+func saveConfig() {
+    data, _ := yaml.Marshal(&config)
+    ioutil.WriteFile("config.yaml", data, 0644)
+}
+
+func sendMessage(text string) {
+    // اگه پیام خیلی طولانیه، تکه تکه کن
+    maxLength := 4000
+    if len(text) <= maxLength {
+        msg := tgbotapi.NewMessage(config.TelegramChatID, text)
+        if _, err := bot.Send(msg); err != nil {
+            log.Printf("❌ Failed to send message: %v", err)
+        }
+        return
+    }
+    
+    // تکه تکه کن
+    parts := []string{}
+    for len(text) > 0 {
+        if len(text) <= maxLength {
+            parts = append(parts, text)
+            break
+        }
+        
+        // پیدا کن آخرین \n قبل از maxLength
+        cutPoint := maxLength
+        for i := maxLength - 1; i > 0; i-- {
+            if text[i] == '\n' {
+                cutPoint = i
+                break
+            }
+        }
+        
+        parts = append(parts, text[:cutPoint])
+        text = text[cutPoint:]
+    }
+    
+    // فرستادن تکه ها
+    for i, part := range parts {
+        if i > 0 {
+            time.Sleep(1 * time.Second) // جلوگیری از rate limit
+        }
+        msg := tgbotapi.NewMessage(config.TelegramChatID, part)
+        if _, err := bot.Send(msg); err != nil {
+            log.Printf("❌ Failed to send message part %d: %v", i+1, err)
+        }
+    }
+}
+
+
